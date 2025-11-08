@@ -4,7 +4,7 @@
   / /__/ / /   / __/  |   /   / /_  / / / / __/ / /  
  / ___  / /___/ /___ /   |   / __/ / /_/ / /___/ /___
 /_/  /_/_____/_____//_/|_|  /_/    \____/_____/_____/
-v2.0 - Taken from open source Flex Fuel v1.0
+v4 - Fixed temperature and display issues
 This program will sample a 50-150hz signal depending on ethanol 
 content, and output a 0-5V signal via PWM.
 The LCD will display ethanol content, hz input, mv output, fuel temp
@@ -22,22 +22,27 @@ Output pin 3 PWM
 LiquidCrystal lcd(2, 9, 4, 5, 6, 7);  //LCD Keypad Shield
 
 int inpPin = 8;     //define input pin to 8
-int outPin = 3;    //define PWM output, possible pins with LCD are 3, 10 and 11 (UNO)
+int outPin = 3;     //define PWM output, possible pins with LCD are 3, 10 and 11 (UNO)
+int waterPin = A0;  //analog pin for water sensor
 
 //Define global variables
-volatile uint16_t revTick;    //Ticks per revolution
+volatile uint32_t revTick;    //Ticks per revolution (32-bit to avoid overflow)
 uint16_t pwm_output  = 0;     //integer for storing PWM value (0-255 value)
 int HZ = 0;                   //unsigned 16bit integer for storing HZ input
 int ethanol = 0;              //Store ethanol percentage here
+int waterLevel = 0;           //Store water sensor reading
+bool waterDetected = false;   //Water contamination flag
 
-int duty;           //Duty cycle (0.0-100.0)
-float period;       //Store period time here (eg.0.0025 s)
-float temperature = 0;  //Store fuel temperature here
-int fahr = 0;
-int cels = 0;
+int duty;                     //Duty cycle (0.0-100.0)
+float temperature = 0;        //Store fuel temperature here
+float fahr = 0;
 static long highTime = 0;
 static long lowTime = 0;
 static long tempPulse;
+
+bool sensorError = false;     //Track sensor connection status
+bool fuelDetected = false;    //Track if fuel is present
+int noFuelCounter = 0;        //Counter for stable no-fuel detection
 
 void setupTimer()   // setup timer1
 {           
@@ -51,113 +56,249 @@ void setupTimer()   // setup timer1
 ISR(TIMER1_CAPT_vect)    // PULSE DETECTED!  (interrupt automatically triggered, not called by main program)
 {
   revTick = ICR1;      // save duration of last revolution
-  TCNT1 = 0;       // restart timer for next revolution
+  TCNT1 = 0;           // restart timer for next revolution
 }
 
 ISR(TIMER1_OVF_vect)    // counter overflow/timeout
-{ revTick = 0; }        // Ticks per second = 0
-
+{ 
+  revTick = 0;          // Ticks per second = 0
+}
 
 void setup() {
-  lcd.begin(16, 2);
-  lcd.clear();
-  lcd.print("Hello");
-  delay(3000);
-  lcd.clear();
-  lcd.print("Ethanol Analyzer");
-  delay(3000);
-  lcd.clear();
-  lcd.print("Measuring...");
-  delay(3000);
-  lcd.clear();
-
-  pinMode(inpPin,INPUT);
-  setPwmFrequency(outPin,1); //Modify frequency on PWM output
+  pinMode(inpPin, INPUT);
+  pinMode(waterPin, INPUT);  // Set water sensor pin as input
+  setPwmFrequency(outPin, 1); //Modify frequency on PWM output
   setupTimer();
-   // set up the LCD's number of columns and rows:
+  
+  // set up the LCD's number of columns and rows:
   lcd.begin(16, 2);
-  // Initial screen formatting
+  
+  // Startup sequence
+  lcd.clear();
+  lcd.setCursor(3, 0);
+  lcd.print("FLEX FUEL");
+  lcd.setCursor(3, 1);
+  lcd.print("ANALYZER");
+  delay(2000);
+  
+  lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Ethanol:    %");
+  lcd.print("Version 4.0");
   lcd.setCursor(0, 1);
-  lcd.print("     Hz       F");
-
+  lcd.print("Initializing...");
+  delay(2000);
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Ready!");
+  delay(1000);
+  
+  // Show waiting for fuel message
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Waiting for");
+  lcd.setCursor(0, 1);
+  lcd.print("fuel sample...");
 }
-
 
 void loop() {
-  getfueltemp(inpPin); //read fuel temp from input duty cycle
+  // Calculate HZ from timer ticks
+  if (revTick > 0) {
+    HZ = 62500 / revTick;  // 16MHz / 256 prescaler = 62500 ticks/sec
+  } else {
+    HZ = 0;
+  }
 
-  if (revTick > 0) // Avoid dividing by zero, sample in the HZ
-    {HZ = 62200 / revTick;}     // 3456000ticks per minute, 57600 per second 
-    else                        // 62200 per seconmd seems to be more accurate? 
-    {HZ = 0;}                   //needs real sensor test to determine correct tickrate
+  // Detect if fuel is present based on valid frequency readings
+  // We need stable readings for at least a few cycles
+  if (HZ >= 45 && HZ <= 160) {
+    noFuelCounter = 0;  // Reset counter
+    if (!fuelDetected) {
+      fuelDetected = true;
+      // Show analyzing message
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Analyzing fuel");
+      lcd.setCursor(0, 1);
+      lcd.print("Please wait...");
+      delay(1500);  // Give it a moment to stabilize
+      
+      // Set up measurement display
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Ethanol:    %");
+      lcd.setCursor(0, 1);
+      lcd.print("    Hz    F    ");
+    }
+  } else {
+    noFuelCounter++;
+    // If no valid signal for 10 consecutive reads, assume no fuel
+    if (noFuelCounter > 10 && fuelDetected) {
+      fuelDetected = false;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Waiting for");
+      lcd.setCursor(0, 1);
+      lcd.print("fuel sample...");
+      delay(100);
+      return;  // Skip rest of loop
+    } else if (!fuelDetected) {
+      // Still waiting for fuel
+      delay(100);
+      return;
+    }
+  }
 
-  //calculate ethanol percentage
-    if (HZ > 50) // Avoid dividing by zero
-    {ethanol = HZ-50;}
-    else
-    {ethanol = 0;}
+  // Check for sensor errors (out of range but still getting signal)
+  if (HZ > 160 || HZ < 45) {
+    sensorError = true;
+    lcd.setCursor(0, 0);
+    lcd.print("SENSOR ERROR!   ");
+    lcd.setCursor(0, 1);
+    lcd.print("Check Connection");
+    delay(100);
+    return;  // Skip rest of loop
+  } else {
+    sensorError = false;
+  }
 
-  if (ethanol > 99) // Avoid overflow in PWM
-  {ethanol = 99;}
+  // Read fuel temp from input duty cycle (only if HZ is valid)
+  if (HZ > 0) {
+    getfueltemp(inpPin);
+  }
 
-  //Screen calculations
-  pwm_output = 255 * (ethanol*0.01); //calculate output PWM for NEMU
+  // Check for water contamination
+  checkWater();
 
-  lcd.setCursor(10, 0);
+  // Calculate ethanol percentage
+  if (HZ >= 50) {
+    ethanol = HZ - 50;
+  } else {
+    ethanol = 0;
+  }
+
+  // Cap at 100% to avoid overflow
+  if (ethanol > 100) {
+    ethanol = 100;
+  }
+
+  // Calculate output PWM for NEMU (0-255 for 0-100%)
+  pwm_output = map(ethanol, 0, 100, 0, 255);
+
+  // If water detected, show warning screen instead of normal display
+  if (waterDetected) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("*** WARNING ***");
+    lcd.setCursor(0, 1);
+    lcd.print("WATER DETECTED!");
+    delay(2000);  // Hold warning for 2 seconds
+    
+    // Show details
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Ethanol: ");
+    lcd.print(ethanol);
+    lcd.print("%");
+    lcd.setCursor(0, 1);
+    lcd.print("DO NOT USE FUEL!");
+    delay(100);
+    return;  // Skip normal display
+  }
+
+  // Update LCD - Ethanol percentage
+  lcd.setCursor(0, 0);
+  lcd.print("Ethanol:");
+  lcd.setCursor(9, 0);
+  lcd.print("   ");  // Clear old value
+  lcd.setCursor(9, 0);
   lcd.print(ethanol);
+  lcd.print("%");
 
-  lcd.setCursor(2, 1);
+  // Update LCD - Frequency
+  lcd.setCursor(0, 1);
+  lcd.print("   ");  // Clear old value
+  lcd.setCursor(0, 1);
   lcd.print(HZ);
+  lcd.print("Hz");
 
-  fahr = (temperature * 9/5) + 32; // Convert temperature from Celsius to Fahrenheit
+  // Update LCD - Temperature in Fahrenheit
+  lcd.setCursor(8, 1);
+  lcd.print("       ");  // Clear old value
+  lcd.setCursor(8, 1);
+  lcd.print(fahr, 0);  // No decimal places to save space
+  lcd.print((char)223);  // degree symbol
+  lcd.print("F");
+  
+  // Display water status - small indicator
+  lcd.setCursor(14, 1);
+  lcd.print("OK");  // Shows fuel is clean;
 
-//Display temperature in Fahrenheit
-lcd.setCursor(9, 1);
-lcd.print(fahr);
-lcd.print((char)223); // Display degree symbol
-lcd.print("");
+  // PWM output
+  analogWrite(outPin, pwm_output);
 
-  lcd.setCursor(8, 1); 
-  lcd.print(temperature); //Use this for celsius
-
-  //PWM output
-  analogWrite(outPin, pwm_output); //write the PWM value to output pin
-
-  delay(100);  //make screen more easily readable by not updating it too often
-
+  delay(100);  // Update rate limit for readable display
 }
 
-void getfueltemp(int inpPin){ //read fuel temp from input duty cycle
-highTime = 0;
-lowTime = 0;
-
-tempPulse = pulseIn(inpPin,HIGH);
-  if(tempPulse>highTime){
-  highTime = tempPulse;
+void getfueltemp(int inpPin) {
+  // Protect against division by zero
+  if (HZ == 0) {
+    temperature = -40.0;  // Default to minimum temperature
+    fahr = -40.0;
+    return;
   }
 
-tempPulse = pulseIn(inpPin,LOW);
-  if(tempPulse>lowTime){
-  lowTime = tempPulse;
+  highTime = 0;
+  lowTime = 0;
+
+  // Measure pulse high time
+  tempPulse = pulseIn(inpPin, HIGH, 50000);  // 50ms timeout
+  if (tempPulse > highTime) {
+    highTime = tempPulse;
   }
 
-duty = ((100*(highTime/(double (lowTime+highTime))))); //Calculate duty cycle (integer extra decimal)
-float T = (float(1.0/float(HZ)));               //Calculate total period time
-float period = float(100-duty)*T;               //Calculate the active period time (100-duty)*T
-float temp2 = float(10) * float(period);        //Convert ms to whole number
-temperature = ((40.25 * temp2)-81.25); // Calculate temperature for display (1ms = -40, 5ms = 80)
-int cels = int(temperature);
-cels = cels*0.1;
-float fahrtemp = ((temperature*1.8)+32);
-fahr = fahrtemp*0.1;
+  // Measure pulse low time
+  tempPulse = pulseIn(inpPin, LOW, 50000);  // 50ms timeout
+  if (tempPulse > lowTime) {
+    lowTime = tempPulse;
+  }
 
+  // Check for valid pulse readings
+  if (highTime == 0 || lowTime == 0) {
+    temperature = -40.0;  // Default if no valid pulse
+    fahr = -40.0;
+    return;
+  }
+
+  // Calculate duty cycle
+  duty = (100 * (highTime / (double)(lowTime + highTime)));
+  
+  // Calculate period and temperature
+  float T = 1.0 / HZ;                        // Total period time in seconds
+  float period = (100.0 - duty) * T;         // Active period time
+  float temp2 = 10.0 * period;               // Convert to ms scale
+  temperature = (40.25 * temp2) - 81.25;     // Calculate temperature in Celsius
+  
+  // Convert to Fahrenheit
+  fahr = (temperature * 1.8) + 32.0;
+}
+
+void checkWater() {
+  // Read water sensor (adjust threshold based on your specific sensor)
+  waterLevel = analogRead(waterPin);
+  
+  // Typical water sensors read 0-100 when dry, 400-1023 when wet
+  // Adjust this threshold based on your sensor testing
+  if (waterLevel > 300) {  
+    waterDetected = true;
+  } else {
+    waterDetected = false;
+  }
 }
 
 void setPwmFrequency(int pin, int divisor) {
   byte mode;
-  if(pin == 5 || pin == 6 || pin == 9 || pin == 10) {
+  if (pin == 5 || pin == 6 || pin == 9 || pin == 10) {
     switch(divisor) {
       case 1: mode = 0x01; break;
       case 8: mode = 0x02; break;
@@ -166,12 +307,12 @@ void setPwmFrequency(int pin, int divisor) {
       case 1024: mode = 0x05; break;
       default: return;
     }
-    if(pin == 5 || pin == 6) {
+    if (pin == 5 || pin == 6) {
       TCCR0B = TCCR0B & 0b11111000 | mode;
     } else {
       TCCR1B = TCCR1B & 0b11111000 | mode;
     }
-  } else if(pin == 3 || pin == 11) {
+  } else if (pin == 3 || pin == 11) {
     switch(divisor) {
       case 1: mode = 0x01; break;
       case 8: mode = 0x02; break;
@@ -179,10 +320,9 @@ void setPwmFrequency(int pin, int divisor) {
       case 64: mode = 0x04; break;
       case 128: mode = 0x05; break;
       case 256: mode = 0x06; break;
-      case 1024: mode = 0x7; break;
+      case 1024: mode = 0x07; break;
       default: return;
     }
     TCCR2B = TCCR2B & 0b11111000 | mode;
   }
-
 }
